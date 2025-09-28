@@ -95,7 +95,8 @@ class BaseRLAviary(BaseAviary):
                          )
         #### Set a limit on the maximum target speed ###############
         if act == ActionType.VEL:
-            self.SPEED_LIMIT = 0.3 * self.MAX_SPEED_KMH * (1000/3600)
+            # Increased speed limit for cattle herding - need to cover larger distances
+            self.SPEED_LIMIT = 0.6 * self.MAX_SPEED_KMH * (1000/3600)  # 5.0 m/s instead of 2.5 m/s
 
     ################################################################################
 
@@ -123,10 +124,20 @@ class BaseRLAviary(BaseAviary):
         act_lower_bound = np.array([-1*np.ones(size) for i in range(self.NUM_DRONES)])
         act_upper_bound = np.array([+1*np.ones(size) for i in range(self.NUM_DRONES)])
         #
+        # Clear existing action buffer and reinitialize with correct dimensions
+        self.action_buffer.clear()
         for i in range(self.ACTION_BUFFER_SIZE):
             self.action_buffer.append(np.zeros((self.NUM_DRONES,size)))
         #
         return spaces.Box(low=act_lower_bound, high=act_upper_bound, dtype=np.float32)
+
+    ###############################################################################
+
+    def _reinitializeControllers(self):
+        """Reinitialize controllers when NUM_DRONES changes."""
+        if hasattr(self, 'ACT_TYPE') and self.ACT_TYPE in [ActionType.PID, ActionType.VEL, ActionType.ONE_D_PID]:
+            if hasattr(self, 'DRONE_MODEL') and self.DRONE_MODEL in [DroneModel.CF2X, DroneModel.CF2P]:
+                self.ctrl = [DSLPIDControl(drone_model=DroneModel.CF2X) for i in range(self.NUM_DRONES)]
 
     ###############################################################################
 
@@ -283,35 +294,49 @@ class BaseRLAviary(BaseAviary):
 
         obs_dim = obs.shape[1]
 
+        # Get herd centroid for relative positioning
+        herd_center = self.HerdCentroid()[:2]  # x, y coordinates only
+        
         for i in range(N):
             obs_vec = self._getDroneStateVector(i)
             drone_pos = obs_vec[0:3]
+            
+            # Make drone position relative to herd center for better generalization
+            drone_pos_relative = drone_pos.copy()
+            drone_pos_relative[0] -= herd_center[0]
+            drone_pos_relative[1] -= herd_center[1]
 
-            # Own state: position, RPY, linear vel, angular vel
+            # Own state: herd-relative position, RPY, linear vel, angular vel
             obs_i = list(np.hstack([
-                drone_pos,            # x, y, z
+                drone_pos_relative,   # x, y, z relative to herd center
                 obs_vec[7:10],        # roll, pitch, yaw
                 obs_vec[10:13],       # linear velocity vx, vy, vz
                 obs_vec[13:16],       # angular velocity wx, wy, wz
             ]))
 
-            # Relative positions of nearby drones
+            # Relative positions of nearby drones (relative to current drone's herd-relative position)
             rel_neighbors = []
             for j in range(N):
                 if i == j:
                     continue
                 other_pos = self._getDroneStateVector(j)[0:2]  # x, y only
-                rel_neighbors.append(other_pos - drone_pos[0:2])
+                # Make other drone position relative to herd center first
+                other_pos_relative = other_pos - herd_center
+                # Then relative to current drone's herd-relative position
+                rel_neighbors.append(other_pos_relative - drone_pos_relative[0:2])
             while len(rel_neighbors) < self.MAX_NEIGHBORS:
                 rel_neighbors.append(np.zeros(2))
             rel_neighbors = np.array(rel_neighbors[:self.MAX_NEIGHBORS]).flatten()
             obs_i.extend(rel_neighbors)
 
-            # Relative positions of nearby cattle
+            # Relative positions of nearby cattle (relative to current drone's herd-relative position)
             rel_cattle = []
             for j in range(M):
                 cow_pos = self._getCowStateVector(j)[0:2]
-                rel_cattle.append(cow_pos - drone_pos[0:2])
+                # Make cattle position relative to herd center first
+                cow_pos_relative = cow_pos - herd_center
+                # Then relative to current drone's herd-relative position
+                rel_cattle.append(cow_pos_relative - drone_pos_relative[0:2])
             while len(rel_cattle) < self.MAX_NEARBY_CATTLE:
                 rel_cattle.append(np.zeros(2))
             rel_cattle = np.array(rel_cattle[:self.MAX_NEARBY_CATTLE]).flatten()
@@ -330,9 +355,12 @@ class BaseRLAviary(BaseAviary):
 
             obs[i, :] = obs_i_array
 
+        # Debug observation space (optional, every 200 steps) - COMMENTED OUT FOR PERFORMANCE
+        # if hasattr(self, 'step_counter') and self.step_counter % 200 == 0 and N > 0:
+        #     print(f"[DEBUG] Obs - Herd center: {herd_center}, Drone 0 abs pos: {self._getDroneStateVector(0)[:2]}, "
+        #           f"Drone 0 rel pos: {obs[0][:2]}")
+
         return obs
-
-
 
     ################################################################################  
     

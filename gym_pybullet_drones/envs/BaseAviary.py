@@ -120,6 +120,8 @@ class BaseAviary(gym.Env, MathematicalFlock):
         self.Cattle_Spawn_Index = 0
         self.step_counter_A = 0
         self.is_evaluating = False
+        self.training_mode = True  # Set to False during evaluation/deployment
+        self.training_herd_center = [0, 0]  # Store randomized herd center
         #### Evaluation Metrics ####################################
         self.total_drone_distances = [] #array of arrays with elemnts of each drones total distacne travlled per episode
         self.total_time_taken = [] #array of time take for each simulation
@@ -247,41 +249,102 @@ class BaseAviary(gym.Env, MathematicalFlock):
     ################################################################################
     def initialize_drone_positions(self, spawn_origin=[0, 0], spacing=1.75):
         """
-        Computes initial positions for all drones.
-        - For 4 or fewer drones: single row
-        - For more than 4 drones: two rows
-        All positions are positive.
+        Computes initial positions for all drones centered around spawn_origin.
+        - For 4 or fewer drones: single row centered on spawn_origin
+        - For more than 4 drones: two rows centered on spawn_origin
         Returns: np.array of shape (NUM_DRONES, 3)
         """
         positions = []
+        origin_x, origin_y = spawn_origin
 
         if self.NUM_DRONES <= 4:
-            # Single row along x-axis
-            start_x = (self.NUM_DRONES - 1) * spacing / 2  # start at 0 after shift
-            y = 0  # all positive
+            # Single row along x-axis, centered around origin
+            start_x = origin_x - (self.NUM_DRONES - 1) * spacing / 2
+            y = origin_y
             for i in range(self.NUM_DRONES):
-                x = i * spacing
+                x = start_x + i * spacing
                 positions.append([x, y, self.DRONE_TARGET_ALTITUDE])
 
         else:
-            # Two rows
+            # Two rows, centered around origin
             n_row1 = self.NUM_DRONES // 2
             n_row2 = self.NUM_DRONES - n_row1
-            y_spacing = spacing
+            
+            # Center the rows horizontally around origin_x
+            row1_start_x = origin_x - (n_row1 - 1) * spacing / 2
+            row2_start_x = origin_x - (n_row2 - 1) * spacing / 2
+            
+            # Center the rows vertically around origin_y
+            y1 = origin_y - spacing / 2  # first row
+            y2 = origin_y + spacing / 2  # second row
 
             # Row 1
             for i in range(n_row1):
-                x = i * spacing
-                y = 0  # first row
-                positions.append([x, y, self.DRONE_TARGET_ALTITUDE])
+                x = row1_start_x + i * spacing
+                positions.append([x, y1, self.DRONE_TARGET_ALTITUDE])
 
             # Row 2
             for i in range(n_row2):
-                x = i * spacing
-                y = y_spacing  # second row
-                positions.append([x, y, self.DRONE_TARGET_ALTITUDE])
+                x = row2_start_x + i * spacing
+                positions.append([x, y2, self.DRONE_TARGET_ALTITUDE])
 
         return np.array(positions)
+
+    def deploy_formation_around_herd(self):
+        """
+        Deploy learned formation around current herd position.
+        Returns desired drone positions maintaining learned formation pattern.
+        """
+        # Get current herd center
+        current_herd_center = self.HerdCentroid()[:2]
+        
+        # Get learned formation pattern (relative to formation center)
+        learned_formation_offsets = self.get_learned_formation_pattern()
+        
+        # Calculate desired positions: herd_center + learned_offsets
+        desired_positions = []
+        for offset in learned_formation_offsets:
+            desired_pos = [
+                current_herd_center[0] + offset[0],
+                current_herd_center[1] + offset[1],
+                self.DRONE_TARGET_ALTITUDE
+            ]
+            desired_positions.append(desired_pos)
+            
+        return np.array(desired_positions)
+    
+    def get_learned_formation_pattern(self):
+        """
+        Extract the learned formation pattern as relative offsets from center.
+        This should be called after training to get the optimal formation.
+        """
+        # Default formation pattern (can be updated with learned pattern)
+        if self.NUM_DRONES <= 4:
+            # Single row formation offsets
+            offsets = []
+            start_x = -(self.NUM_DRONES - 1) * 1.75 / 2
+            for i in range(self.NUM_DRONES):
+                x_offset = start_x + i * 1.75
+                offsets.append([x_offset, 0.0])
+        else:
+            # Two row formation offsets
+            offsets = []
+            n_row1 = self.NUM_DRONES // 2
+            n_row2 = self.NUM_DRONES - n_row1
+            
+            # Row 1 offsets
+            row1_start_x = -(n_row1 - 1) * 1.75 / 2
+            for i in range(n_row1):
+                x_offset = row1_start_x + i * 1.75
+                offsets.append([x_offset, -0.875])
+                
+            # Row 2 offsets
+            row2_start_x = -(n_row2 - 1) * 1.75 / 2
+            for i in range(n_row2):
+                x_offset = row2_start_x + i * 1.75
+                offsets.append([x_offset, 0.875])
+                
+        return offsets
 
     def reset(self,
               seed : int = None,
@@ -307,18 +370,30 @@ class BaseAviary(gym.Env, MathematicalFlock):
         """
         # print(f"NEW EPISODE, last episode has {self.step_counter_A} steps")
         self.step_counter_A = 0
-        self.NUM_DRONES = random.randint(self.MIN_NUM_DRONES, self.MAX_NUM_DRONES)
+        # Keep NUM_DRONES fixed during RL training to maintain consistent action space
+        # self.NUM_DRONES = random.randint(self.MIN_NUM_DRONES, self.MAX_NUM_DRONES)
         #### Create action and observation spaces ##################
         self.action_space = self._actionSpace()
         self.observation_space = self._observationSpace()
+        #### Reinitialize controllers for new number of drones ####
+        if hasattr(self, '_reinitializeControllers'):
+            self._reinitializeControllers()
 
 
         #### Set initial poses #####################################
-        self.INIT_XYZS = self.initialize_drone_positions()
+        # Randomize herd location during training for better generalization
+        if hasattr(self, 'training_mode') and self.training_mode:
+            # Random herd center within reasonable bounds
+            herd_center = np.random.uniform(-4.0, 4.0, size=2)
+            self.training_herd_center = herd_center
+        else:
+            # Use default center for evaluation/deployment
+            herd_center = [0, 0]
+            
+        self.INIT_XYZS = self.initialize_drone_positions(spawn_origin=herd_center)
         self.INIT_RPYS = np.zeros((self.NUM_DRONES, 3))
         self.last_drones_pos = [np.zeros(2) for _ in range(self.NUM_DRONES)]
-        self.action_buffer = [np.zeros((self.NUM_DRONES, self.action_space.shape[0]), dtype=np.float32)
-                      for _ in range(self.ACTION_BUFFER_SIZE)]
+        # Note: action_buffer is handled in _actionSpace() method, not here
         
         p.resetSimulation(physicsClientId=self.CLIENT)
         #### Housekeeping ##########################################
@@ -453,7 +528,8 @@ class BaseAviary(gym.Env, MathematicalFlock):
         #### Update and store the drones kinematic information #####
         self._updateAndStoreKinematicInformation()
         #### Update the flocking ##############################
-        self._flockingStep() 
+        # AA - disabled
+        # self._flockingStep() 
         #### Prepare the return values #############################
         obs = self._computeObs()
         reward = self._computeReward()
@@ -613,11 +689,24 @@ class BaseAviary(gym.Env, MathematicalFlock):
             cow_info = cows[i]
             x, y = cow_info["x"], cow_info["y"]
             z = 0.1  # keep z fixed
-            cow_id = p.loadURDF(
-                "cube_no_rotation.urdf",
-                [x, y, z],
-                p.getQuaternionFromEuler([0, 0, 0]),
-                globalScaling=0.2,
+            # Create cattle as simple visual shapes instead of URDF
+            cattle_visual = p.createVisualShape(
+                p.GEOM_BOX,
+                halfExtents=[0.1, 0.1, 0.05],
+                rgbaColor=[0.8, 0.4, 0.2, 1.0],  # Brown color for cattle
+                physicsClientId=self.CLIENT
+            )
+            cattle_collision = p.createCollisionShape(
+                p.GEOM_BOX,
+                halfExtents=[0.1, 0.1, 0.05],
+                physicsClientId=self.CLIENT
+            )
+            cow_id = p.createMultiBody(
+                baseMass=1.0,
+                baseCollisionShapeIndex=cattle_collision,
+                baseVisualShapeIndex=cattle_visual,
+                basePosition=[x, y, z],
+                baseOrientation=p.getQuaternionFromEuler([0, 0, 0]),
                 physicsClientId=self.CLIENT
             )
             self.CATTLE_IDS.append(cow_id)

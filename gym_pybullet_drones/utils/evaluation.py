@@ -133,6 +133,56 @@ class evaluator():
         effectiveness = total_herded_cattle / len(cattle_poses) * 100 if len(cattle_poses) > 0 else 0
         return effectiveness
 
+    def calculate_effectiveness_spacing(self, drones_poses):
+        """
+        Alternative effectiveness calculation based on drone spacing.
+        Returns 100% effectiveness if the two closest neighboring drones are exactly 0.5 units apart.
+        Uses a Gaussian-like function to smoothly decay effectiveness as distance deviates from 0.5.
+        
+        Parameters:
+        -----------
+        drones_poses : array-like
+            Positions of drones, shape (n_drones, 2) for 2D coordinates
+            
+        Returns:
+        --------
+        float
+            Effectiveness percentage (0-100)
+        """
+        # Convert to numpy array and ensure 2D shape
+        drones_poses = np.array(drones_poses)
+        
+        if drones_poses.ndim == 1:
+            drones_poses = drones_poses.reshape(-1, 2)
+        elif drones_poses.ndim == 3:
+            drones_poses = drones_poses.reshape(-1, 2)
+        
+        # Need at least 2 drones to calculate spacing
+        if len(drones_poses) < 2:
+            return 0.0
+            
+        # Calculate all pairwise distances between drones
+        distances = []
+        n_drones = len(drones_poses)
+        
+        for i in range(n_drones):
+            for j in range(i + 1, n_drones):
+                dist = np.linalg.norm(drones_poses[i] - drones_poses[j])
+                distances.append(dist)
+        
+        # Find the minimum distance (closest neighbors)
+        min_distance = min(distances)
+        
+        # Target distance for optimal spacing
+        target_distance = 0.5
+        
+        # Calculate effectiveness using Gaussian-like decay
+        # 100% at target distance, decreasing as distance deviates
+        sigma = 0.1  # Controls how quickly effectiveness drops off
+        effectiveness = 100 * np.exp(-((min_distance - target_distance) ** 2) / (2 * sigma ** 2))
+        
+        return float(effectiveness)
+
 
 
 def is_left(p0, p1, p2):
