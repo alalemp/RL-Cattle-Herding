@@ -96,7 +96,13 @@ class BaseRLAviary(BaseAviary):
         #### Set a limit on the maximum target speed ###############
         if act == ActionType.VEL:
             # Increased speed limit for cattle herding - need to cover larger distances
-            self.SPEED_LIMIT = 0.6 * self.MAX_SPEED_KMH * (1000/3600)  # 5.0 m/s instead of 2.5 m/s
+            if hasattr(self, 'training_mode') and not self.training_mode:
+                # EVALUATION MODE: Much higher speed limit for override system
+                self.SPEED_LIMIT = 2.0 * self.MAX_SPEED_KMH * (1000/3600)  # ~16.7 m/s for evaluation
+                print(f"[EVAL MODE] Speed limit increased to {self.SPEED_LIMIT:.1f} m/s for aggressive override")
+            else:
+                # TRAINING MODE: Normal speed limit
+                self.SPEED_LIMIT = 0.6 * self.MAX_SPEED_KMH * (1000/3600)  # 5.0 m/s for training
 
     ################################################################################
 
@@ -368,21 +374,34 @@ class BaseRLAviary(BaseAviary):
         """
         Calculates the center of the herd and updates the visual centroid marker to that location.
         """
+        # Handle case where there are no cattle (e.g., Phase 1 curriculum learning)
+        if self.NUM_CATTLE == 0:
+            # Return origin as default centroid when no cattle present
+            centroid = np.array([0.0, 0.0, self.DRONE_TARGET_ALTITUDE+0.5])
+        else:
+            cattle_states = np.array([self._getCowStateVector(i) for i in range(self.NUM_CATTLE)])
+            # Ensure cattle_states is 2D even with 1 cow
+            if cattle_states.ndim == 1:
+                cattle_states = cattle_states.reshape(1, -1)
+            
+            cattle_positions = cattle_states[:, 0:3]
+            
+            # Compute XY centroid
+            centroid_xy = np.mean(cattle_positions[:, :2], axis=0)
+            centroid = np.array([centroid_xy[0], centroid_xy[1], self.DRONE_TARGET_ALTITUDE+0.5])
 
-        cattle_states = np.array([self._getCowStateVector(i) for i in range(self.NUM_CATTLE)])
-        cattle_positions = cattle_states[:, 0:3]
-
-        # Compute XY centroid
-        centroid_xy = np.mean(cattle_positions[:, :2], axis=0)
-        centroid = np.array([centroid_xy[0], centroid_xy[1], self.DRONE_TARGET_ALTITUDE+0.5])
-
-        # Update visual marker position
-        p.resetBasePositionAndOrientation(
-            self.CattleCentroidMarker,
-            centroid,
-            p.getQuaternionFromEuler([0, 0, 0]),
-            physicsClientId=self.CLIENT
-        )
+        # Update visual marker position (safely handle marker updates)
+        try:
+            if hasattr(self, 'CattleCentroidMarker') and self.CattleCentroidMarker is not None:
+                p.resetBasePositionAndOrientation(
+                    self.CattleCentroidMarker,
+                    centroid,
+                    p.getQuaternionFromEuler([0, 0, 0]),
+                    physicsClientId=self.CLIENT
+                )
+        except Exception as e:
+            # Marker update failed, continue without visual marker
+            pass
 
         return centroid
 

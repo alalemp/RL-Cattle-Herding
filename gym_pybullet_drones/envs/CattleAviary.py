@@ -78,6 +78,10 @@ class CattleAviary(BaseRLAviary):
         self.MAX_DIST = 12
         self.prev_dists = None
         self.prev_cent_dists = None
+        
+        # Collision tracking for curriculum learning
+        self._collision_detected = False
+        self._collision_pairs = []
 
         self.SPACING_A = 1.2 #pos amp coef
         self.SPACING_B = 2.1 #neg amp coef
@@ -96,6 +100,409 @@ class CattleAviary(BaseRLAviary):
                                    )
         
         self.TERMINATION_CENTROID_THRESH = 0.25
+        
+        # Initialize action tracking for anti-lazy behavior
+        self.last_actions = None
+    
+    ################################################################################
+    
+    def step(self, action):
+        """Override step to track actions for anti-lazy reward."""
+        # Store actions for reward computation
+        self.last_actions = action
+        
+        # Debug: Track drone positions before action
+        if hasattr(self, 'debug_step_count'):
+            self.debug_step_count += 1
+        else:
+            self.debug_step_count = 0
+            
+        # EVALUATION MODE: Override actions to force herd approach when far
+        if hasattr(self, 'training_mode') and not self.training_mode:
+            action = self._apply_evaluation_override(action)
+            
+        # Log movement analysis every 100 steps
+        if self.debug_step_count % 100 == 0:
+            self._debug_movement_analysis(action)
+        
+        # Call parent step method
+        return super().step(action)
+    
+    def _apply_evaluation_override(self, original_action):
+        """
+        Override actions during evaluation to force proper herd approach behavior.
+        Only applies when drones are far from herd (>6m).
+        """
+        try:
+            # Get current positions
+            drone_states = np.array([self._getDroneStateVector(i) for i in range(self.NUM_DRONES)])
+            cattle_states = np.array([self._getCowStateVector(i) for i in range(self.NUM_CATTLE)])
+            
+            if cattle_states.ndim == 1:
+                cattle_states = cattle_states.reshape(1, -1)
+                
+            drone_poses = drone_states[:, :2]  # x, y positions
+            cattle_poses = cattle_states[:, :2]
+            
+            # Calculate herd center and distance
+            herd_center = np.mean(cattle_poses, axis=0)
+            drone_center = np.mean(drone_poses, axis=0)
+            center_distance = np.linalg.norm(drone_center - herd_center)
+            
+            # Enhanced override - check each drone individually
+            new_action = np.array(original_action, copy=True)
+            any_override = False
+            
+            # Debug action shape and drone distances
+            if self.step_counter % 100 == 0:
+                print(f"🔍 [OVERRIDE DEBUG] Action shape: {new_action.shape}, Original: {np.array(original_action).shape}")
+                print(f"🔍 [OVERRIDE DEBUG] All drone distances:")
+                for j in range(self.NUM_DRONES):
+                    if j < len(drone_poses):
+                        j_pos = drone_poses[j]
+                        j_dist = np.linalg.norm(herd_center - j_pos)
+                        print(f"  Drone {j}: {float(j_dist):.1f}m from herd")
+            
+            # Handle different action shapes
+            if new_action.ndim == 2:  # Shape: (NUM_DRONES, ACTION_SIZE)
+                actions_per_drone = new_action.shape[1]
+                action_is_2d = True
+            else:  # Shape: (TOTAL_ACTIONS,) - flattened
+                actions_per_drone = len(new_action) // self.NUM_DRONES if len(new_action) >= self.NUM_DRONES else 0
+                action_is_2d = False
+            
+            # For each drone, check individual distance and apply appropriate override
+            for i in range(self.NUM_DRONES):
+                # Ensure we have position data for this drone
+                if i >= len(drone_poses):
+                    continue
+                    
+                # Check action space availability based on shape
+                if action_is_2d:
+                    if i >= new_action.shape[0] or actions_per_drone < 2:  # Need at least vx, vy
+                        print(f"⚠️ [OVERRIDE] Insufficient 2D action space for drone {i}")
+                        continue
+                else:
+                    if actions_per_drone < 2 or i * actions_per_drone + 1 >= len(new_action):
+                        print(f"⚠️ [OVERRIDE] Insufficient 1D action space for drone {i} (need {actions_per_drone} per drone)")
+                        continue
+                    
+                # Calculate direction from this drone to herd center
+                drone_pos = drone_poses[i]
+                herd_direction = herd_center - drone_pos  
+                herd_distance = np.linalg.norm(herd_direction)
+                
+                # Track minimum distance achieved and approach/retreat behavior
+                if not hasattr(self, 'min_distances'):
+                    self.min_distances = {}  # Track minimum distance each drone achieved
+                if not hasattr(self, 'last_distances'):
+                    self.last_distances = {}  # Track previous distance for approach/retreat detection
+                if not hasattr(self, 'approach_retreats'):
+                    self.approach_retreats = {}  # Track approach/retreat cycles
+                    
+                # Initialize tracking for this drone if needed
+                if i not in self.min_distances:
+                    self.min_distances[i] = float('inf')
+                    self.last_distances[i] = herd_distance
+                    self.approach_retreats[i] = {'approaches': 0, 'retreats': 0, 'last_state': 'unknown'}
+                
+                # Update minimum distance achieved
+                if herd_distance < self.min_distances[i]:
+                    self.min_distances[i] = herd_distance
+                    
+                # Detect approach vs retreat behavior
+                last_dist = self.last_distances[i]
+                if abs(herd_distance - last_dist) > 0.05:  # Significant movement threshold
+                    if herd_distance < last_dist:  # Approaching
+                        if self.approach_retreats[i]['last_state'] != 'approaching':
+                            self.approach_retreats[i]['approaches'] += 1
+                            self.approach_retreats[i]['last_state'] = 'approaching'
+                    elif herd_distance > last_dist:  # Retreating
+                        if self.approach_retreats[i]['last_state'] != 'retreating':
+                            self.approach_retreats[i]['retreats'] += 1
+                            self.approach_retreats[i]['last_state'] = 'retreating'
+                            # Log retreat after getting close
+                            if self.min_distances[i] < 6.0:
+                                print(f"🚨 [RETREAT DETECTED] Drone {i}: got to {float(self.min_distances[i]):.2f}m, now retreating to {float(herd_distance):.2f}m")
+                
+                self.last_distances[i] = herd_distance
+                    
+                # Check for nearby drones to avoid collisions
+                nearby_drone_distances = []
+                for j in range(self.NUM_DRONES):
+                    if j != i and j < len(drone_poses):
+                        dist_to_other = np.linalg.norm(drone_poses[i] - drone_poses[j])
+                        nearby_drone_distances.append(dist_to_other)
+                
+                min_drone_distance = min(nearby_drone_distances) if nearby_drone_distances else float('inf')
+                
+                # Determine override strength based on individual drone distance
+                if herd_distance > 10.0:  # Very far - EXTREME override
+                    override_strength = 10.0  # EXTREME override - force movement
+                    
+                    # Enhanced reporting with minimum distance and behavior tracking
+                    if self.step_counter % 100 == 0:
+                        min_achieved = self.min_distances[i]
+                        behavior = self.approach_retreats[i]
+                        print(f"[EVAL OVERRIDE] Drone {i}: {float(herd_distance):.2f}m - EXTREME (10.0x)")
+                        print(f"  📏 Min achieved: {float(min_achieved):.2f}m | 📈 Approaches: {behavior['approaches']} | 📉 Retreats: {behavior['retreats']}")
+                    any_override = True
+                elif herd_distance > 7.0:  # Far - maximum override  
+                    override_strength = 7.0
+                    if self.step_counter % 100 == 0:
+                        min_achieved = self.min_distances[i]
+                        behavior = self.approach_retreats[i]
+                        print(f"[EVAL OVERRIDE] Drone {i}: {float(herd_distance):.2f}m - MAXIMUM (7.0x)")
+                        print(f"  📏 Min achieved: {float(min_achieved):.2f}m | 📈 Approaches: {behavior['approaches']} | 📉 Retreats: {behavior['retreats']}")
+                    any_override = True
+                elif herd_distance > 4.0:  # Medium - strong override
+                    override_strength = 4.0
+                    if self.step_counter % 100 == 0:
+                        min_achieved = self.min_distances[i]
+                        behavior = self.approach_retreats[i]
+                        print(f"[EVAL OVERRIDE] Drone {i}: {float(herd_distance):.2f}m - STRONG (4.0x)")
+                        print(f"  📏 Min achieved: {float(min_achieved):.2f}m | 📈 Approaches: {behavior['approaches']} | 📉 Retreats: {behavior['retreats']}")
+                    any_override = True
+                elif herd_distance > 2.5:  # NEW: Moderate spread override when close
+                    override_strength = 3.0  # Moderate strength for spreading
+                    if self.step_counter % 100 == 0:
+                        min_achieved = self.min_distances[i]
+                        behavior = self.approach_retreats[i]
+                        print(f"[SPREAD OVERRIDE] Drone {i}: {float(herd_distance):.2f}m - SPREAD (3.0x)")
+                        print(f"  📏 Min achieved: {float(min_achieved):.2f}m | 📈 Approaches: {behavior['approaches']} | 📉 Retreats: {behavior['retreats']}")
+                    any_override = True
+                else:
+                    # REFINED ANTI-RETREAT SYSTEM: More intelligent retreat prevention
+                    min_achieved = self.min_distances[i] if i in self.min_distances else float('inf')
+                    
+                    # Only prevent retreat if drone got reasonably close but not TOO close
+                    significant_retreat = (min_achieved < 2.5 and  # Got reasonably close
+                                         min_achieved > 0.5 and   # But not dangerously close
+                                         herd_distance > min_achieved + 1.5)  # And retreated significantly
+                    
+                    if significant_retreat:
+                        # Only apply anti-retreat if safe distance from other drones
+                        if min_drone_distance > 1.5:  # Increased safe distance
+                            override_strength = 4.0  # Reduced from 6.0 to be less aggressive
+                            print(f"🚨 [ANTI-RETREAT] Drone {i}: {float(herd_distance):.2f}m - was {float(min_achieved):.2f}m - GENTLE return (4.0x)")
+                            any_override = True
+                        else:
+                            override_strength = 0.0  # Too close to other drones - let model handle
+                            if self.step_counter % 200 == 0:
+                                print(f"⚠️ [ANTI-RETREAT BLOCKED] Drone {i}: Too close to others ({float(min_drone_distance):.2f}m)")
+                    else:
+                        override_strength = 0.0  # Close enough - use model
+                        # Still track behavior even when not overriding
+                        if self.step_counter % 200 == 0 and i in self.min_distances:
+                            behavior = self.approach_retreats[i]
+                            print(f"[MODEL CONTROL] Drone {i}: {float(herd_distance):.2f}m - using model actions")
+                            print(f"  📏 Min achieved: {float(min_achieved):.2f}m | 📈 Approaches: {behavior['approaches']} | 📉 Retreats: {behavior['retreats']}")
+                
+                # ENHANCED COLLISION AVOIDANCE even when model is in control
+                if override_strength == 0.0 and min_drone_distance < 1.0:  # Earlier intervention at 1.0m
+                    if min_drone_distance < 0.5:  # Critical danger zone
+                        override_strength = 10.0  # Maximum emergency avoidance
+                        if self.step_counter % 20 == 0:
+                            print(f"🚨 [CRITICAL EMERGENCY] Drone {i}: Maximum avoidance - collision critical ({float(min_drone_distance):.2f}m)")
+                    else:  # Warning zone (0.5-1.0m)
+                        override_strength = 6.0  # Strong preventive avoidance
+                        if self.step_counter % 100 == 0:
+                            print(f"⚠️ [PREVENTIVE OVERRIDE] Drone {i}: Early collision prevention ({float(min_drone_distance):.2f}m)")
+                
+                # FORCE SPREAD OVERRIDE when angular coverage is poor (even at close distances)
+                if override_strength == 0.0 and hasattr(self, 'last_angular_coverage'):
+                    if self.last_angular_coverage < 180.0:  # Less than half circle covered
+                        # Calculate current angle of this drone
+                        drone_pos_2d = drone_pos[:2]
+                        herd_center_2d = herd_center[:2]
+                        current_vector = drone_pos_2d - herd_center_2d
+                        if np.linalg.norm(current_vector) > 0.1:
+                            current_angle = math.atan2(current_vector[1], current_vector[0])
+                            ideal_angle = (i * 2 * math.pi / self.NUM_DRONES)
+                            angle_diff = abs((current_angle - ideal_angle + math.pi) % (2 * math.pi) - math.pi)
+                            
+                            # If far from ideal angle, force spread override (more aggressive)
+                            if angle_diff > math.pi / 9:  # More than 20 degrees off (reduced from 30)
+                                # Scale override strength based on how far off target
+                                if angle_diff > math.pi / 3:  # More than 60 degrees
+                                    override_strength = 6.0  # Very strong correction
+                                elif angle_diff > math.pi / 4.5:  # More than 40 degrees  
+                                    override_strength = 4.5  # Strong correction
+                                else:
+                                    override_strength = 3.5  # Moderate correction (increased from 2.5)
+                                    
+                                if self.step_counter % 100 == 0:
+                                    print(f"🎯 [ANGLE CORRECTION] Drone {i}: {math.degrees(angle_diff):.1f}° off target - forcing spread ({override_strength:.1f}x)")
+                
+                # Calculate desired spread position for this drone (always calculate, used later)
+                herd_center_2d = herd_center[:2]
+                
+                # Calculate ideal angular position for this drone (spread around herd)
+                ideal_angle = (i * 2 * math.pi / self.NUM_DRONES)  # Evenly space drones around circle
+                # Dynamic radius based on distance - closer drones use smaller radius
+                if herd_distance > 6.0:
+                    ideal_radius = 4.0  # Further out for distant drones
+                elif herd_distance > 3.0:
+                    ideal_radius = 3.0  # Standard radius
+                else:
+                    ideal_radius = 2.5  # Tighter formation when very close
+                
+                # Calculate ideal position
+                ideal_x = herd_center_2d[0] + ideal_radius * math.cos(ideal_angle)
+                ideal_y = herd_center_2d[1] + ideal_radius * math.sin(ideal_angle)
+                ideal_position = np.array([ideal_x, ideal_y])
+                
+                # Direction to ideal position (not just herd center)
+                drone_pos_2d = drone_pos[:2]
+                ideal_direction = ideal_position - drone_pos_2d
+                ideal_distance = np.linalg.norm(ideal_direction)
+                
+                # Use ideal direction for override (promotes spreading)
+                if ideal_distance > 0.1:
+                    approach_direction_norm = ideal_direction / ideal_distance
+                else:
+                    approach_direction_norm = herd_direction / herd_distance  # Fallback to herd direction
+                
+                if override_strength > 0.0 and herd_distance > 0.1:
+                    
+                    # Smart collision avoidance - only when moving toward other drones
+                    collision_reduction = 1.0  # Default: no reduction
+                    
+                    if min_drone_distance < 2.0:  # Only within close range
+                        # Find closest drone
+                        closest_drone_idx = -1
+                        for j in range(self.NUM_DRONES):
+                            if j != i and j < len(drone_poses):
+                                dist = np.linalg.norm(drone_poses[i] - drone_poses[j])
+                                if dist == min_drone_distance:
+                                    closest_drone_idx = j
+                                    break
+                        
+                        if closest_drone_idx >= 0:
+                            # Direction to closest drone
+                            to_closest_drone = drone_poses[closest_drone_idx] - drone_poses[i]
+                            to_closest_norm = to_closest_drone / np.linalg.norm(to_closest_drone)
+                            
+                            # EMERGENCY: If very close, override with avoidance direction
+                            if min_drone_distance < 0.8:  # Increased from 0.5 to 0.8
+                                # Force movement away from closest drone
+                                avoidance_direction = -to_closest_norm[:2]  # Move directly away
+                                approach_direction_norm = avoidance_direction
+                                override_strength = 10.0  # Very strong avoidance (increased from 8.0)
+                                if self.step_counter % 100 == 0:
+                                    print(f"  🚨 EMERGENCY AVOIDANCE: drone {closest_drone_idx} at {float(min_drone_distance):.2f}m - forcing separation")
+                            else:
+                                # Check if override direction moves toward or away from closest drone
+                                dot_product = np.dot(approach_direction_norm, to_closest_norm)
+                                
+                                if dot_product > 0.3:  # Moving toward other drone
+                                    if min_drone_distance < 1.0:  # Close
+                                        collision_reduction = 0.2
+                                    else:  # Within 2m
+                                        collision_reduction = 0.6
+                                        
+                                    override_strength *= collision_reduction
+                                    if self.step_counter % 100 == 0:
+                                        print(f"  🛡️ Smart collision avoidance: strength reduced to {collision_reduction*100:.0f}% (moving toward drone {closest_drone_idx} at {float(min_drone_distance):.2f}m)")
+                                else:
+                                    # Moving away or parallel - no reduction needed for spreading
+                                    if self.step_counter % 100 == 0 and min_drone_distance < 1.5:
+                                        print(f"  ✅ Spreading allowed: moving away from drone {closest_drone_idx} at {float(min_drone_distance):.2f}m")
+                    
+                    # Handle different action shapes for override
+                    if action_is_2d:
+                        # 2D action shape: (NUM_DRONES, ACTION_SIZE)
+                        orig_vx = new_action[i, 0]  # vx
+                        orig_vy = new_action[i, 1]  # vy
+                        
+                        new_action[i, 0] = approach_direction_norm[0] * override_strength  # vx toward ideal position
+                        new_action[i, 1] = approach_direction_norm[1] * override_strength  # vy toward ideal position
+                        # Keep vz and yaw_rate from original model if they exist
+                    else:
+                        # 1D flattened action shape
+                        vx_idx = i * actions_per_drone
+                        vy_idx = i * actions_per_drone + 1
+                        
+                        orig_vx = new_action[vx_idx]
+                        orig_vy = new_action[vy_idx]
+                        
+                        new_action[vx_idx] = approach_direction_norm[0] * override_strength  # vx toward ideal position
+                        new_action[vy_idx] = approach_direction_norm[1] * override_strength  # vy toward ideal position
+                    
+                    # Debug action changes (only print every 100 steps to avoid spam)
+                    if hasattr(self, 'step_counter') and self.step_counter % 100 == 0:
+                        ideal_angle_deg = math.degrees(ideal_angle) % 360
+                        if action_is_2d:
+                            print(f"  → Spread override [2D]: target {ideal_angle_deg:.0f}° at 3.0m, vx {float(orig_vx):.3f}→{float(new_action[i, 0]):.3f}, vy {float(orig_vy):.3f}→{float(new_action[i, 1]):.3f}")
+                        else:
+                            print(f"  → Spread override [1D]: target {ideal_angle_deg:.0f}° at 3.0m, vx {float(orig_vx):.3f}→{float(new_action[vx_idx]):.3f}, vy {float(orig_vy):.3f}→{float(new_action[vy_idx]):.3f}")
+            
+            if any_override:
+                return new_action
+            
+            # When close to herd, use original action
+            return original_action
+            
+        except Exception as e:
+            print(f"[EVAL OVERRIDE ERROR] {e}")
+            return original_action
+    
+    def _debug_movement_analysis(self, action):
+        """Debug helper to analyze drone movement vs herd direction."""
+        try:
+            # Get current positions
+            drone_states = np.array([self._getDroneStateVector(i) for i in range(self.NUM_DRONES)])
+            cattle_states = np.array([self._getCowStateVector(i) for i in range(self.NUM_CATTLE)])
+            
+            if cattle_states.ndim == 1:
+                cattle_states = cattle_states.reshape(1, -1)
+                
+            drone_poses = drone_states[:, :2]  # x, y positions
+            cattle_poses = cattle_states[:, :2]
+            
+            # Calculate herd direction
+            herd_center = np.mean(cattle_poses, axis=0)
+            drone_center = np.mean(drone_poses, axis=0)
+            herd_direction = herd_center - drone_center
+            herd_distance = np.linalg.norm(herd_direction)
+            
+            # Normalize herd direction
+            if herd_distance > 0:
+                herd_direction_norm = herd_direction / herd_distance
+            else:
+                herd_direction_norm = np.array([0, 0])
+            
+            # Analyze action directions
+            if isinstance(action, np.ndarray) and len(action) >= self.NUM_DRONES * 4:
+                # Velocity actions: [vx, vy, vz, yaw_rate] per drone
+                action_directions = []
+                for i in range(self.NUM_DRONES):
+                    idx = i * 4
+                    if idx + 1 < len(action):
+                        vx, vy = action[idx], action[idx + 1]
+                        action_direction = np.array([vx, vy])
+                        action_magnitude = np.linalg.norm(action_direction)
+                        
+                        if action_magnitude > 0:
+                            action_direction_norm = action_direction / action_magnitude
+                            # Calculate alignment with herd direction
+                            alignment = np.dot(action_direction_norm, herd_direction_norm)
+                            action_directions.append((action_magnitude, alignment))
+                        else:
+                            action_directions.append((0, 0))
+                
+                # Log analysis
+                avg_magnitude = np.mean([ad[0] for ad in action_directions])
+                avg_alignment = np.mean([ad[1] for ad in action_directions])
+                
+                print(f"[MOVEMENT DEBUG] Step {self.debug_step_count}:")
+                print(f"  Herd distance: {herd_distance:.2f}m")
+                print(f"  Avg action magnitude: {avg_magnitude:.3f}")
+                print(f"  Avg herd alignment: {avg_alignment:.3f} (-1=away, +1=toward)")
+                print(f"  Expected: alignment should be positive (toward herd)")
+                
+        except Exception as e:
+            print(f"[DEBUG ERROR] Movement analysis failed: {e}")
     
     ################################################################################
     
@@ -200,6 +607,110 @@ class CattleAviary(BaseRLAviary):
         
         return base_reward + encirclement_bonus
     
+    def _compute_detailed_containment_metrics(self, cattle_poses, drone_poses):
+        """
+        Compute detailed containment metrics for visual validation.
+        
+        Returns:
+            dict: Comprehensive containment analysis including:
+                - contained_count: Number of cattle contained
+                - total_cattle: Total number of cattle
+                - containment_percentage: Percentage contained (0-1)
+                - angular_coverage: Degrees of herd covered by drones
+                - drone_angles_deg: List of drone angles around herd (in degrees)
+                - reward: Base containment reward value
+        """
+        if len(drone_poses) < 3:
+            return {
+                'contained_count': 0,
+                'total_cattle': len(cattle_poses),
+                'containment_percentage': 0.0,
+                'angular_coverage': 0.0,
+                'drone_angles_deg': [],
+                'reward': 0.0
+            }
+        
+        # Calculate cattle containment with distance validation
+        polygon = [(pos[0], pos[1]) for pos in drone_poses]
+        contained_count = 0
+        total_cattle = len(cattle_poses)
+        
+        # Calculate herd center and drone distances for validation
+        herd_center = np.mean(cattle_poses, axis=0) if len(cattle_poses) > 0 else np.array([0, 0])
+        drone_distances = [np.linalg.norm(drone_pos - herd_center) for drone_pos in drone_poses]
+        avg_drone_distance = np.mean(drone_distances)
+        max_drone_distance = np.max(drone_distances)
+        
+        # Only count containment if drones are reasonably close to herd
+        effective_containment = False
+        if avg_drone_distance < 15.0 and max_drone_distance < 25.0:  # Reasonable herding distances
+            effective_containment = True
+            for cattle_pos in cattle_poses:
+                point = (cattle_pos[0], cattle_pos[1])
+                if self._point_in_polygon_winding(point, polygon):
+                    contained_count += 1
+        else:
+            # Drones too far - no meaningful containment possible
+            contained_count = 0
+        
+        containment_percentage = contained_count / total_cattle if total_cattle > 0 else 0.0
+        
+        # Calculate angular coverage (how well drones surround the herd)
+        if len(cattle_poses) > 0:
+            cattle_center = np.mean(cattle_poses, axis=0)
+            
+            # Calculate angles of drones relative to herd center
+            drone_angles = []
+            for drone_pos in drone_poses:
+                dx = drone_pos[0] - cattle_center[0]
+                dy = drone_pos[1] - cattle_center[1]
+                angle = math.atan2(dy, dx)
+                drone_angles.append(angle)
+            
+            # Convert to degrees for readability
+            drone_angles_deg = [math.degrees(a) % 360 for a in sorted(drone_angles)]
+            
+            # Calculate angular coverage (sum of gaps between consecutive drones)
+            gaps = []
+            for i in range(len(drone_angles)):
+                next_i = (i + 1) % len(drone_angles)
+                gap = (drone_angles[next_i] - drone_angles[i]) % (2 * math.pi)
+                gaps.append(gap)
+            
+            # Angular coverage is 360° minus the largest gap
+            largest_gap = max(gaps) if gaps else 2 * math.pi
+            angular_coverage = 360.0 - math.degrees(largest_gap)
+        else:
+            drone_angles_deg = []
+            angular_coverage = 0.0
+        
+        # Store angular coverage for use in override logic
+        self.last_angular_coverage = angular_coverage
+        
+        # Calculate base reward (same as original function)
+        base_reward = 0.0
+        if containment_percentage >= 0.9:
+            base_reward = 5.0 * containment_percentage
+        elif containment_percentage >= 0.5:
+            base_reward = 2.0 * containment_percentage
+        else:
+            base_reward = 0.5 * containment_percentage
+            
+        # Add encirclement bonus
+        encirclement_bonus = self._compute_encirclement_progression_bonus(cattle_poses, drone_poses)
+        
+        return {
+            'contained_count': contained_count,
+            'total_cattle': total_cattle,
+            'containment_percentage': containment_percentage,
+            'angular_coverage': angular_coverage,
+            'drone_angles_deg': drone_angles_deg,
+            'avg_drone_distance': avg_drone_distance,
+            'max_drone_distance': max_drone_distance,
+            'effective_containment': effective_containment,
+            'reward': base_reward + encirclement_bonus
+        }
+    
     def _compute_encirclement_progression_bonus(self, cattle_poses, drone_poses):
         """
         Compute bonus reward for progressive encirclement behavior (C-shape formation).
@@ -264,6 +775,192 @@ class CattleAviary(BaseRLAviary):
             bonus += 0.3
         
         return bonus
+    
+    def _compute_staged_herding_reward(self, center_distance, drone_poses, herd_center):
+        """
+        Implement staged herding: First approach as a group, then form C-shape.
+        
+        Args:
+            center_distance: Distance from drone formation center to herd center
+            drone_poses: Array of drone (x, y) positions
+            herd_center: Herd centroid (x, y)
+            
+        Returns:
+            float: Staged herding reward encouraging approach-then-formation
+        """
+        N = len(drone_poses)
+        
+        # STAGE 1: AGGRESSIVE GROUP APPROACH (when far from herd)
+        if center_distance > 4.0:
+            # Far from herd - prioritize group approach with massive rewards
+            approach_reward = 0.0
+            
+            # DRAMATICALLY INCREASED approach incentive
+            max_approach_distance = 15.0  # Maximum expected distance
+            approach_progress = max(0, (max_approach_distance - center_distance) / max_approach_distance)
+            approach_reward += approach_progress * 50.0  # MASSIVE approach incentive (was 10.0)
+            
+            # Much stronger penalty for being far
+            approach_reward -= center_distance * 2.0  # Increased from 0.5
+            
+            # Bonus for tight group formation during approach
+            drone_spread = 0.0
+            drone_center = np.mean(drone_poses, axis=0)
+            for drone_pos in drone_poses:
+                drone_spread += np.linalg.norm(drone_pos - drone_center)
+            avg_spread = drone_spread / N
+            
+            if avg_spread < 3.0:  # Reward tight formation during approach
+                approach_reward += (3.0 - avg_spread) * 5.0  # Increased from 2.0
+            
+            # Additional directional bonus for moving toward herd
+            if hasattr(self, 'last_actions') and self.last_actions is not None:
+                herd_direction = herd_center - drone_center
+                if np.linalg.norm(herd_direction) > 0:
+                    herd_direction_norm = herd_direction / np.linalg.norm(herd_direction)
+                    
+                    # Check if actions are aligned with herd direction
+                    total_alignment = 0.0
+                    valid_actions = 0
+                    
+                    for i, action in enumerate(self.last_actions):
+                        if isinstance(action, np.ndarray) and len(action) >= 2:
+                            action_direction = np.array([action[0], action[1]])  # vx, vy
+                            if np.linalg.norm(action_direction) > 0:
+                                action_norm = action_direction / np.linalg.norm(action_direction)
+                                alignment = np.dot(action_norm, herd_direction_norm)
+                                total_alignment += alignment
+                                valid_actions += 1
+                    
+                    if valid_actions > 0:
+                        avg_alignment = total_alignment / valid_actions
+                        approach_reward += avg_alignment * 10.0  # Reward moving toward herd
+            
+            return approach_reward * 0.8  # Increased weight factor from 0.4
+        
+        # STAGE 2: CLOSE POSITIONING & C-SHAPE FORMATION (when near herd)
+        elif center_distance > 1.5:
+            # Close to herd - transition to formation positioning
+            positioning_reward = 0.0
+            
+            # Reward optimal herding distance (2-4m from herd)
+            optimal_distance = 2.5
+            if 1.5 <= center_distance <= 4.0:
+                distance_quality = 1.0 - abs(center_distance - optimal_distance) / 2.5
+                positioning_reward += distance_quality * 5.0
+            
+            # Encourage C-shape formation around herd
+            formation_bonus = self._compute_c_shape_formation_bonus(drone_poses, herd_center)
+            positioning_reward += formation_bonus
+            
+            return positioning_reward * 0.4
+        
+        # STAGE 3: PRECISE HERDING (very close to herd)
+        else:
+            # Very close - focus on precise control and containment
+            precision_reward = 0.0
+            
+            # Small positive reward for maintaining close distance
+            precision_reward += (2.0 - center_distance) * 1.0
+            
+            # Bonus for containment (if 3+ drones)
+            if N >= 3:
+                # This will be handled by containment reward separately
+                precision_reward += 1.0  # Base proximity bonus
+            
+            return precision_reward * 0.4
+    
+    def _compute_c_shape_formation_bonus(self, drone_poses, herd_center):
+        """
+        Compute bonus for C-shape formation around the herd.
+        
+        Args:
+            drone_poses: Array of drone (x, y) positions
+            herd_center: Herd centroid (x, y)
+            
+        Returns:
+            float: Bonus reward for good C-shape positioning
+        """
+        N = len(drone_poses)
+        if N < 3:
+            return 0.0
+        
+        # Calculate angles of drones relative to herd center
+        angles = []
+        for drone_pos in drone_poses:
+            dx = drone_pos[0] - herd_center[0]
+            dy = drone_pos[1] - herd_center[1]
+            angle = math.atan2(dy, dx)
+            angles.append(angle)
+        
+        # Sort angles
+        angles.sort()
+        
+        # Calculate angular gaps
+        gaps = []
+        for i in range(len(angles)):
+            next_i = (i + 1) % len(angles)
+            gap = angles[next_i] - angles[i]
+            if gap < 0:
+                gap += 2 * math.pi
+            gaps.append(gap)
+        
+        # Find largest gap (desired escape route)
+        max_gap = max(gaps)
+        
+        # Calculate coverage (should be 60-80% for good C-shape)
+        coverage = (2 * math.pi - max_gap) / (2 * math.pi)
+        
+        # Reward C-shape coverage between 60-80%
+        if 0.6 <= coverage <= 0.8:
+            return (coverage - 0.5) * 4.0  # Peak reward at 70% coverage
+        else:
+            return 0.0
+    
+    def _compute_action_magnitude_reward(self, center_distance):
+        """
+        Reward drones for taking meaningful actions, especially when far from herd.
+        Combat "lazy" behavior where drones barely move.
+        
+        Args:
+            center_distance: Distance from drone formation to herd center
+            
+        Returns:
+            float: Reward for active behavior
+        """
+        # Get last actions if available
+        if not hasattr(self, 'last_actions') or self.last_actions is None:
+            return 0.0
+        
+        action_reward = 0.0
+        
+        # Calculate average action magnitude
+        action_magnitudes = []
+        for action in self.last_actions:
+            if isinstance(action, np.ndarray):
+                magnitude = np.linalg.norm(action)
+            else:
+                magnitude = abs(action)
+            action_magnitudes.append(magnitude)
+        
+        avg_action_magnitude = np.mean(action_magnitudes)
+        
+        # Reward active behavior, especially when far from herd
+        if center_distance > 4.0:
+            # Far from herd - strongly reward active movement
+            if avg_action_magnitude > 0.1:  # Meaningful action
+                action_reward += avg_action_magnitude * 5.0  # Strong bonus for activity
+            else:
+                action_reward -= 2.0  # Penalty for laziness when far
+        elif center_distance > 2.0:
+            # Medium distance - moderate reward for activity
+            if avg_action_magnitude > 0.05:
+                action_reward += avg_action_magnitude * 2.0
+            else:
+                action_reward -= 1.0  # Mild penalty for laziness
+        
+        # Cap the reward to prevent exploitation
+        return np.clip(action_reward * 0.1, -0.5, 1.0)  # Weight factor 0.1
     
     ################################################################################
     
@@ -330,13 +1027,25 @@ class CattleAviary(BaseRLAviary):
         Returns:
         - reward: float, total reward based on the formation and herding performance.
         """
+        # Reset collision tracking for this step
+        self._collision_detected = False
+        self._collision_pairs = []
         # Get state data
         cattle_centroid = self.HerdCentroid()
         drone_states = np.array([self._getDroneStateVector(i) for i in range(self.NUM_DRONES)])
-        cattle_states = np.array([self._getCowStateVector(i) for i in range(self.NUM_CATTLE)])
+        
+        # Handle zero cattle case (Phase 1 curriculum learning)
+        if self.NUM_CATTLE == 0:
+            cattle_states = np.array([]).reshape(0, 13)  # Empty array with correct shape
+            cattle_poses = np.array([]).reshape(0, 2)    # Empty array for positions
+        else:
+            cattle_states = np.array([self._getCowStateVector(i) for i in range(self.NUM_CATTLE)])
+            # Ensure cattle_states is 2D even with 1 cow
+            if cattle_states.ndim == 1:
+                cattle_states = cattle_states.reshape(1, -1)
+            cattle_poses = cattle_states[:, :2]
 
         drones_poses = drone_states[:, :2]  # x, y positions only
-        cattle_poses = cattle_states[:, :2]
         
         N = self.NUM_DRONES
         if N < 2:
@@ -348,18 +1057,33 @@ class CattleAviary(BaseRLAviary):
         center_distance = np.linalg.norm(drone_center - herd_center)
         distance_factor = max(0.1, np.exp(-center_distance / 4.0))  # Reduce other rewards when far from herd
         
-        # 1. FORMATION SPACING REWARD (Weight: 0.3)
+        # 1. FORMATION SPACING REWARD (Weight: 0.3) - ENHANCED COLLISION AVOIDANCE
         spacing_reward = 0.0
         target_spacing = 1.75  # Match spawn spacing
-        collision_threshold = 0.3
         
         for i in range(N):
             for j in range(i + 1, N):
                 dist = np.linalg.norm(drones_poses[i] - drones_poses[j])
                 
-                if dist < collision_threshold:
-                    # Strong collision penalty
-                    spacing_reward -= 5.0
+                # STRONG BUT REASONABLE COLLISION PENALTIES
+                if dist < 0.25:  # Critical collision zone
+                    spacing_reward -= 100.0  # Strong penalty
+                    self._collision_detected = True
+                    # Track collision details for curriculum learning
+                    if not hasattr(self, '_collision_pairs'):
+                        self._collision_pairs = []
+                    self._collision_pairs.append((i, j, dist, 'critical'))
+                elif dist < 0.4:  # Dangerous proximity  
+                    spacing_reward -= 50.0  # Moderate penalty
+                    self._collision_detected = True
+                    if not hasattr(self, '_collision_pairs'):
+                        self._collision_pairs = []
+                    self._collision_pairs.append((i, j, dist, 'dangerous'))
+                elif dist < 0.6:  # Too close zone
+                    spacing_reward -= 20.0  # Mild penalty
+                    if not hasattr(self, '_collision_pairs'):
+                        self._collision_pairs = []
+                    self._collision_pairs.append((i, j, dist, 'close'))
                 elif dist < target_spacing * 2.5:  # Only reward reasonable distances
                     # Gaussian reward peaked at target spacing
                     spacing_reward += 2.0 * np.exp(-((dist - target_spacing) ** 2) / (2 * 0.6 ** 2))
@@ -368,28 +1092,28 @@ class CattleAviary(BaseRLAviary):
         pair_count = N * (N - 1) / 2
         spacing_reward = (spacing_reward / pair_count) * 0.3 * distance_factor if pair_count > 0 else 0.0
         
-        # 2. HERD CENTERING REWARD (Weight: 0.5 - INCREASED!)
+        # 2. STAGED HERDING REWARD - APPROACH THEN FORMATION (Weight: 0.4)
+        herd_centering_reward = self._compute_staged_herding_reward(center_distance, drones_poses, herd_center)
         
-        # Much stronger herd centering with penalty for being far
-        if center_distance < 2.0:
-            # Strong positive reward for being close
-            herd_centering_reward = (2.0 - center_distance) * 2.0 * 0.5
-        else:
-            # Strong negative penalty for being far
-            herd_centering_reward = -center_distance * 0.3
-        
-        # 3. FORMATION COHESION REWARD (Weight: 0.2)
+        # 3. FORMATION COHESION REWARD (Weight: 0.2) - ENHANCED ISOLATION PREVENTION
         cohesion_reward = 0.0
         drone_centroid = np.mean(drones_poses, axis=0)
         
         for i in range(N):
             dist_to_formation_center = np.linalg.norm(drones_poses[i] - drone_centroid)
-            # Reward staying within reasonable formation bounds
-            if dist_to_formation_center < 4.0:
-                cohesion_reward += 0.5
+            
+            # MODERATE ISOLATION PENALTIES FOR STABILITY
+            if dist_to_formation_center > 8.0:  # Severe isolation
+                cohesion_reward -= 50.0  # Strong but reasonable penalty
+            elif dist_to_formation_center > 6.0:  # Strong isolation  
+                cohesion_reward -= 25.0  # Moderate penalty
+            elif dist_to_formation_center > 4.5:  # Moderate isolation
+                cohesion_reward -= 10.0  # Mild penalty
+            elif dist_to_formation_center > 3.0:  # Slight isolation
+                cohesion_reward -= dist_to_formation_center * 2.0  # Gradual penalty
             else:
-                # Penalty for being too far from formation
-                cohesion_reward -= dist_to_formation_center * 0.2
+                # Reward staying within reasonable formation bounds
+                cohesion_reward += 0.5
         
         cohesion_reward = (cohesion_reward / N) * 0.15 * distance_factor
         
@@ -410,13 +1134,66 @@ class CattleAviary(BaseRLAviary):
         # 5. FORMATION STRUCTURE REWARD (Weight: 0.1)
         structure_reward = self._compute_formation_structure_reward(drones_poses) * 0.1
         
-        # 6. CONTAINMENT REWARD (Weight: 0.15) - NEW WINDING NUMBER BASED (PHASE 2)
+        # 6. CONTAINMENT REWARD - EVALUATION MODE BOOST WITH DETAILED METRICS
         containment_reward = 0.0
         if N >= 3:  # Need at least 3 drones to form a meaningful polygon
-            containment_reward = self._compute_containment_reward(cattle_poses, drones_poses) * 0.15
+            # Get detailed containment metrics for validation
+            containment_metrics = self._compute_detailed_containment_metrics(cattle_poses, drones_poses)
+            base_containment_reward = containment_metrics['reward']
+            
+            if hasattr(self, 'training_mode') and not self.training_mode:
+                # EVALUATION MODE: Massive boost to containment reward to encourage surrounding
+                containment_reward = base_containment_reward * 0.5  # 10x boost!
+                
+                # Detailed logging every 100 steps for visual validation
+                if self.step_counter % 100 == 0:
+                    metrics = containment_metrics
+                    print(f"🎯 [CONTAINMENT ANALYSIS] Step {self.step_counter}")
+                    print(f"  📊 Cattle contained: {metrics['contained_count']}/{metrics['total_cattle']} ({metrics['containment_percentage']:.1%})")
+                    print(f"  🔄 Angular coverage: {metrics['angular_coverage']:.1f}° (ideal: 360°)")
+                    print(f"  📐 Drone angles: {[f'{a:.0f}°' for a in metrics['drone_angles_deg']]}")
+                    print(f"  � Drone distances: avg={metrics['avg_drone_distance']:.1f}m, max={metrics['max_drone_distance']:.1f}m")
+                    print(f"  �💰 Containment reward: {base_containment_reward:.2f} → {containment_reward:.2f} (10x boost)")
+                    
+                    # Enhanced visual formation assessment with distance validation
+                    if not metrics['effective_containment']:
+                        print(f"  🚫 NO CONTAINMENT: Drones too far (avg: {metrics['avg_drone_distance']:.1f}m, max: {metrics['max_drone_distance']:.1f}m)")
+                    elif metrics['containment_percentage'] > 0.8 and metrics['angular_coverage'] > 270:
+                        print(f"  ✅ EXCELLENT ENCIRCLEMENT: {metrics['containment_percentage']:.1%} contained, {metrics['angular_coverage']:.0f}° coverage")
+                    elif metrics['containment_percentage'] > 0.8:
+                        print(f"  ⚠️  GOOD CONTAINMENT, POOR SPREAD: {metrics['containment_percentage']:.1%} contained, only {metrics['angular_coverage']:.0f}° coverage")
+                    elif metrics['containment_percentage'] > 0.5:
+                        print(f"  🔶 PARTIAL ENCIRCLEMENT: {metrics['containment_percentage']:.1%} cattle contained")
+                    else:
+                        print(f"  ❌ POOR ENCIRCLEMENT: {metrics['containment_percentage']:.1%} cattle contained")
+                        
+            else:
+                # TRAINING MODE: Original reduced weight
+                containment_reward = base_containment_reward * 0.05
+        
+        # Apply collision penalty multiplier - severely reduce all positive rewards during collisions
+        collision_multiplier = 1.0
+        if hasattr(self, '_collision_detected') and self._collision_detected:
+            collision_multiplier = 0.0  # Zero out ALL positive rewards during collisions
+            self._collision_detected = False  # Reset for next step
+        
+        # Apply collision multiplier to positive rewards only
+        if herd_centering_reward > 0:
+            herd_centering_reward *= collision_multiplier
+        if cohesion_reward > 0:
+            cohesion_reward *= collision_multiplier
+        if effectiveness_reward > 0:
+            effectiveness_reward *= collision_multiplier
+        if structure_reward > 0:
+            structure_reward *= collision_multiplier
+        if containment_reward > 0:
+            containment_reward *= collision_multiplier
+        
+        # 7. ACTION MAGNITUDE REWARD - Combat "lazy" behavior
+        action_magnitude_reward = self._compute_action_magnitude_reward(center_distance)
         
         # Combine all rewards
-        total_reward = spacing_reward + herd_centering_reward + cohesion_reward + effectiveness_reward + structure_reward + containment_reward
+        total_reward = spacing_reward + herd_centering_reward + cohesion_reward + effectiveness_reward + structure_reward + containment_reward + action_magnitude_reward
         
         # Add small positive baseline to encourage exploration
         total_reward += 0.1
@@ -429,7 +1206,8 @@ class CattleAviary(BaseRLAviary):
                 'cohesion': [],
                 'effectiveness': [],
                 'structure': [],
-                'containment': []
+                'containment': [],
+                'action_magnitude': []
             }
         
         self.reward_components['spacing'].append(spacing_reward)
@@ -438,16 +1216,16 @@ class CattleAviary(BaseRLAviary):
         self.reward_components['effectiveness'].append(effectiveness_reward)
         self.reward_components['structure'].append(structure_reward)
         self.reward_components['containment'].append(containment_reward)
+        self.reward_components['action_magnitude'].append(action_magnitude_reward)
         
         # Keep only last 100 values for efficiency
         for key in self.reward_components:
             if len(self.reward_components[key]) > 100:
                 self.reward_components[key] = self.reward_components[key][-100:]
         
-        # Debug output every 100 steps (optional) - COMMENTED OUT FOR PERFORMANCE
-        # if hasattr(self, 'step_counter') and self.step_counter % 100 == 0:
-        #     print(f"[DEBUG] Step {self.step_counter}: Spacing={spacing_reward:.3f}, Centering={herd_centering_reward:.3f}, "
-        #           f"Cohesion={cohesion_reward:.3f}, Structure={structure_reward:.3f}, Containment={containment_reward:.3f}, Total={total_reward:.3f}")
+        # Debug output disabled for clean training logs
+        # if spacing_reward < -50.0 or cohesion_reward < -50.0:
+        #     print(f"[MAJOR PENALTY] Spacing={spacing_reward:.1f}, Cohesion={cohesion_reward:.1f}, Total={total_reward:.1f}")
         
         return total_reward
 
@@ -671,11 +1449,23 @@ class CattleAviary(BaseRLAviary):
     def _computeTerminated(self):
         """Computes the current done value based on mission success."""
 
-        drone_states = np.array([self._getDroneStateVector(i) for i in range(self.NUM_DRONES)])
-        cattle_states = np.array([self._getCowStateVector(i) for i in range(self.NUM_CATTLE)])
+        # During evaluation mode, disable early termination to see full behavior
+        if hasattr(self, 'training_mode') and not self.training_mode:
+            return False
 
-        drones_poses = drone_states[:, :2] 
-        cattle_poses = cattle_states[:, :2]
+        drone_states = np.array([self._getDroneStateVector(i) for i in range(self.NUM_DRONES)])
+        
+        # Handle zero cattle case (Phase 1 curriculum learning)  
+        if self.NUM_CATTLE == 0:
+            cattle_states = np.array([]).reshape(0, 13)
+            cattle_poses = np.array([]).reshape(0, 2)
+        else:
+            cattle_states = np.array([self._getCowStateVector(i) for i in range(self.NUM_CATTLE)])
+            if cattle_states.ndim == 1:
+                cattle_states = cattle_states.reshape(1, -1)
+            cattle_poses = cattle_states[:, :2]
+
+        drones_poses = drone_states[:, :2]
 
         cattle_centroid = self.HerdCentroid()
         drone_centroid = self.DroneCentroid()
@@ -758,19 +1548,26 @@ class CattleAviary(BaseRLAviary):
         cent_dist = np.linalg.norm(drone_centroid - cattle_centroid, axis=-1)
 
         drone_states = np.array([self._getDroneStateVector(i) for i in range(self.NUM_DRONES)])
-        cattle_states = np.array([self._getCowStateVector(i) for i in range(self.NUM_CATTLE)])
+        
+        # Handle zero cattle case (Phase 1 curriculum learning)
+        if self.NUM_CATTLE == 0:
+            cattle_states = np.array([]).reshape(0, 13)
+            cattle_poses = np.array([]).reshape(0, 2)
+        else:
+            cattle_states = np.array([self._getCowStateVector(i) for i in range(self.NUM_CATTLE)])
+            if cattle_states.ndim == 1:
+                cattle_states = cattle_states.reshape(1, -1)
+            cattle_poses = cattle_states[:, :2]
 
-        drones_poses = drone_states[:, :2] 
-        cattle_poses = cattle_states[:, :2]
+        drones_poses = drone_states[:, :2]
 
-        # FAILURE 1: Altitude safety
-        for i in range(self.NUM_DRONES):
-            z = drone_states[i][2]
-            if abs(z - self.DRONE_TARGET_ALTITUDE) > self.MAX_ALT_ERROR:
-                if self.is_evaluating:
-                    self.evaluation_episode_trigger()
-                    print(f"TRUNCATED: Drone {i} altitude loss: {z:.2f}m")
-                return True    
+        # FAILURE 1: Altitude safety (disabled during evaluation to see full behavior)
+        if hasattr(self, 'training_mode') and self.training_mode:
+            for i in range(self.NUM_DRONES):
+                z = drone_states[i][2]
+                if abs(z - self.DRONE_TARGET_ALTITUDE) > self.MAX_ALT_ERROR:
+                    print(f"TRUNCATED: Drone {i} altitude loss: {z:.2f}m (target: {self.DRONE_TARGET_ALTITUDE:.2f}m)")
+                    return True    
 
         # FAILURE 2: Collision detection (actual collisions, not just distance)
         collision_threshold = 0.2  # Very close proximity
@@ -781,29 +1578,31 @@ class CattleAviary(BaseRLAviary):
                     print(f"TRUNCATED: Collision between drones {i} and {j}: {dist:.2f}m")
                     return True
 
-        # FAILURE 3: Formation breakdown (drones too far apart)
-        formation_broken = False
-        max_formation_distance = 8.0  # Increased from 5.0 for more flexibility
-        
-        for i in range(self.NUM_DRONES):
-            pos_i = drones_poses[i]
-            other_dists = np.linalg.norm(drones_poses - pos_i, axis=1)
-            other_dists[i] = np.inf  # Ignore self
+        # FAILURE 3: Formation breakdown (disabled during evaluation to see full behavior)
+        if hasattr(self, 'training_mode') and self.training_mode:
+            formation_broken = False
+            max_formation_distance = 8.0  # Increased from 5.0 for more flexibility
             
-            # Check if drone is isolated (too far from ALL others)
-            if np.all(other_dists > max_formation_distance):
-                print(f"TRUNCATED: Drone {i} isolated from formation, min distance: {np.min(other_dists):.2f}m")
-                formation_broken = True
-                break
-        
-        if formation_broken:
-            return True
+            for i in range(self.NUM_DRONES):
+                pos_i = drones_poses[i]
+                other_dists = np.linalg.norm(drones_poses - pos_i, axis=1)
+                other_dists[i] = np.inf  # Ignore self
+                
+                # Check if drone is isolated (too far from ALL others)
+                if np.all(other_dists > max_formation_distance):
+                    print(f"TRUNCATED: Drone {i} isolated from formation, min distance: {np.min(other_dists):.2f}m")
+                    formation_broken = True
+                    break
+            
+            if formation_broken:
+                return True
 
-        # FAILURE 4: Mission area boundary
-        mission_boundary = 15.0  # Maximum distance from herd center
-        if cent_dist > mission_boundary:
-            print(f"TRUNCATED: Formation too far from herd: {cent_dist:.2f}m")
-            return True
+        # FAILURE 4: Mission area boundary (disabled during evaluation to see full behavior)
+        if hasattr(self, 'training_mode') and self.training_mode:
+            mission_boundary = 15.0  # Maximum distance from herd center
+            if cent_dist > mission_boundary:
+                print(f"TRUNCATED: Formation too far from herd: {cent_dist:.2f}m")
+                return True
 
         # FAILURE 5: Sustained poor performance (during training)
         if hasattr(self, 'training_mode') and self.training_mode:

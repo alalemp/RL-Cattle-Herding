@@ -819,11 +819,12 @@ class BaseAviary(gym.Env, MathematicalFlock):
             self.rpy[i] = p.getEulerFromQuaternion(self.quat[i])
             self.vel[i], self.ang_v[i] = p.getBaseVelocity(self.DRONE_IDS[i], physicsClientId=self.CLIENT)
 
-        # Cattle
-        for j in range(self.NUM_CATTLE):
-            self.cattle_pos[j], self.cattle_quat[j] = p.getBasePositionAndOrientation(self.CATTLE_IDS[j], physicsClientId=self.CLIENT)
-            self.cattle_rpy[j] = p.getEulerFromQuaternion(self.cattle_quat[j])
-            self.cattle_vel[j], self.cattle_ang_v[j] = p.getBaseVelocity(self.CATTLE_IDS[j], physicsClientId=self.CLIENT)
+        # Cattle (only if cattle exist)
+        if self.NUM_CATTLE > 0 and hasattr(self, 'CATTLE_IDS') and len(self.CATTLE_IDS) > 0:
+            for j in range(min(self.NUM_CATTLE, len(self.CATTLE_IDS))):
+                self.cattle_pos[j], self.cattle_quat[j] = p.getBasePositionAndOrientation(self.CATTLE_IDS[j], physicsClientId=self.CLIENT)
+                self.cattle_rpy[j] = p.getEulerFromQuaternion(self.cattle_quat[j])
+                self.cattle_vel[j], self.cattle_ang_v[j] = p.getBaseVelocity(self.CATTLE_IDS[j], physicsClientId=self.CLIENT)
 
             
     ################################################################################

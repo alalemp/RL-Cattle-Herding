@@ -42,6 +42,7 @@ from stable_baselines3.common.callbacks import EvalCallback, StopTrainingOnRewar
 
 from gym_pybullet_drones.utils.Logger import Logger
 from gym_pybullet_drones.envs.CattleAviary import CattleAviary
+from gym_pybullet_drones.envs.AdvancedCurriculumAviary import AdvancedCurriculumCattleAviary, CurriculumCallback
 from gym_pybullet_drones.utils.utils import sync, str2bool
 from gym_pybullet_drones.utils.enums import ObservationType, ActionType, DroneModel
 
@@ -50,8 +51,8 @@ DEFAULT_RECORD_VIDEO = False
 DEFAULT_OUTPUT_FOLDER = 'models'
 DEFAULT_COLAB = False
 TARGET_REWARD = 99999   # reward threshold to stop training
-LOAD_FILE = "model-alen-v03-0/best_model.zip"  # Phase 2: Load Phase 1 best model and add containment rewards
-# LOAD_FILE = None  # Commented out - was used for fresh Phase 1 start
+# LOAD_FILE = None  # Fresh start with balanced collision avoidance system
+LOAD_FILE = "model-alen-v06-0/best_model.zip"  # Previous model had chaotic learning - commented out
 
 DEFAULT_OBS = ObservationType('cokin') # collaborative kinematics
 DEFAULT_ACT = ActionType('vel')        # 'rpm' | 'pid' | 'vel' | 'one_d_rpm' | 'one_d_pid'
@@ -66,6 +67,10 @@ EVALUATION_FREQUENCY = 2048
 EVALUATE_ONLY = False   # skip training, run evaluation only
 EVAL_EPISODE_LENGTH = 60  # Episode length in seconds for evaluation (default: 60s)
 NUM_EVALUATION_EPS = 50 # 50  # Increase episodes for better statistics
+
+# Advanced Curriculum Learning Configuration
+USE_ADVANCED_CURRICULUM = True  # Enable advanced collision-focused curriculum learning
+CURRICULUM_LOG_FREQUENCY = 2048  # How often to log curriculum status
 
 def evaluate_policy_with_progress(model, env, n_eval_episodes=10, deterministic=True):
     """
@@ -106,6 +111,26 @@ def evaluate_policy_with_progress(model, env, n_eval_episodes=10, deterministic=
         
         all_episode_rewards.append(episode_reward)
         all_episode_lengths.append(episode_length)
+        
+        # Episode completion logging
+        termination_reason = "TERMINATED" if terminated else "TRUNCATED" if truncated else "COMPLETED"
+        try:
+            # Get final states for detailed logging
+            drone_states = [env.unwrapped._getDroneStateVector(i) for i in range(env.unwrapped.NUM_DRONES)]
+            herd_center = env.unwrapped.HerdCentroid()
+            drone_center = np.mean([d[:2] for d in drone_states], axis=0)
+            final_distance = np.linalg.norm(drone_center - herd_center[:2])
+            
+            print(f"\n📊 EPISODE {episode + 1} FINISHED ({termination_reason})")
+            print(f"  📈 Total Reward: {episode_reward:.2f}")
+            print(f"  ⏱️  Episode Length: {episode_length:,} steps")
+            print(f"  📏 Final Distance to Herd: {final_distance:.2f}m")
+            print(f"  🎯 Avg Reward per Step: {episode_reward/episode_length:.3f}")
+        except Exception as e:
+            print(f"\n📊 EPISODE {episode + 1} FINISHED ({termination_reason})")
+            print(f"  📈 Total Reward: {episode_reward:.2f}")
+            print(f"  ⏱️  Episode Length: {episode_length:,} steps")
+            print(f"  ❌ State info unavailable: {e}")
         
         # Progress indicator
         if (episode + 1) % max(1, n_eval_episodes // 20) == 0 or episode == n_eval_episodes - 1:
@@ -153,10 +178,16 @@ def run(
     
     # Set model directory - use different directories for different reward structures
     if eval_only:
-        model_dir = os.path.join(output_folder, 'model-alen-v02-2-0')  # Your trained model
+        model_dir = os.path.join(output_folder, 'model-alen-v06-0')  # Current curriculum-trained model
     else:
-        model_dir = os.path.join(output_folder, 'model-alen-v04-0')  # Phase 2: Containment rewards with winding number algorithm
+        model_dir = os.path.join(output_folder, 'model-alen-v06-0')  # Phase 2: Containment rewards with winding number algorithm
     os.makedirs(model_dir, exist_ok=True)
+    
+    # Debug: Print actual paths
+    print(f"[DEBUG] Working directory: {os.getcwd()}")
+    print(f"[DEBUG] Output folder: {output_folder}")
+    print(f"[DEBUG] Model directory: {model_dir}")
+    print(f"[DEBUG] Absolute model path: {os.path.abspath(model_dir)}")
 
 
     # Environment setup
@@ -201,7 +232,10 @@ def run(
     if not eval_only:
         # Update environment creation to use curriculum
         def make_env():
-            return CurriculumCattleAviary(**env_kwargs)
+            if USE_ADVANCED_CURRICULUM:
+                return AdvancedCurriculumCattleAviary(**env_kwargs)
+            else:
+                return CurriculumCattleAviary(**env_kwargs)
 
         train_env = make_vec_env(
             make_env, 
@@ -212,7 +246,10 @@ def run(
 
         # Create evaluation environment that matches training
         def make_eval_env():
-            env = CurriculumCattleAviary(**env_kwargs)
+            if USE_ADVANCED_CURRICULUM:
+                env = AdvancedCurriculumCattleAviary(**env_kwargs)
+            else:
+                env = CurriculumCattleAviary(**env_kwargs)
             env.training_mode = False  # Disable randomization for consistent eval
             return env
         
@@ -417,9 +454,18 @@ def run(
         
         # Add formation logging
         formation_logger = FormationLoggingCallback(verbose=1)
+        
+        # Add curriculum learning callback if using advanced curriculum
+        callbacks = [eval_callback, formation_logger]
+        if USE_ADVANCED_CURRICULUM:
+            curriculum_callback = CurriculumCallback(log_frequency=CURRICULUM_LOG_FREQUENCY)
+            callbacks.append(curriculum_callback)
+            print(f"🎓 [CURRICULUM] Advanced curriculum learning enabled")
+            print(f"    Collision-focused progressive learning")
+            print(f"    Logging frequency: {CURRICULUM_LOG_FREQUENCY} steps")
 
         # Train without early stopping to allow learning new reward structure
-        model.learn(total_timesteps=MAX_TIMESTEPS, callback=[eval_callback, formation_logger], log_interval=100)
+        model.learn(total_timesteps=MAX_TIMESTEPS, callback=callbacks, log_interval=100)
         model.save(os.path.join(model_dir, "final_model.zip"))
         print(f"[LOG] Training finished. Model saved in {model_dir}")
 
@@ -442,8 +488,16 @@ def run(
         eval_kwargs = env_kwargs.copy()
         eval_kwargs['gui'] = use_gui
         eval_kwargs['eval_episode_length'] = EVAL_EPISODE_LENGTH
-        env = CurriculumCattleAviary(**eval_kwargs)
-        env.training_mode = False
+        
+        # Use the same curriculum environment as training
+        if USE_ADVANCED_CURRICULUM:
+            env = AdvancedCurriculumCattleAviary(**eval_kwargs)
+            # Force evaluation to use final training phase (Phase 2)
+            env.curriculum_phase = 2  # Use final phase rewards
+            env.training_mode = False
+        else:
+            env = CurriculumCattleAviary(**eval_kwargs)
+            env.training_mode = False
         return env
     
     # Create ONLY ONE environment to avoid PyBullet multiple connection error
@@ -499,6 +553,14 @@ def run(
         #test_env.render()
         sync(i, start, test_env.CTRL_TIMESTEP)
         if terminated or truncated:
+            # Log rollout episode completion
+            termination_reason = "TERMINATED" if terminated else "TRUNCATED"
+            episode_step = i
+            episode_time = i / test_env.CTRL_FREQ
+            print(f"\n🔄 ROLLOUT EPISODE FINISHED ({termination_reason})")
+            print(f"  ⏱️  Duration: {episode_time:.1f}s ({episode_step:,} steps)")
+            print(f"  📈 Final Reward: {reward:.3f}")
+            print(f"  🔄 Resetting environment...")
             obs, _ = test_env.reset(seed=42, options={})
             
     test_env.close()
