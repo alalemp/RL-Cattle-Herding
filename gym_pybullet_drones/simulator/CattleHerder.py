@@ -52,7 +52,7 @@ DEFAULT_OUTPUT_FOLDER = 'models'
 DEFAULT_COLAB = False
 TARGET_REWARD = 99999   # reward threshold to stop training
 # LOAD_FILE = None  # Fresh start with balanced collision avoidance system
-LOAD_FILE = "model-alen-v06-0/best_model.zip"  # Previous model had chaotic learning - commented out
+LOAD_FILE = "model-v06-0/best_model.zip"  # Previous model had chaotic learning - commented out
 
 DEFAULT_OBS = ObservationType('cokin') # collaborative kinematics
 DEFAULT_ACT = ActionType('vel')        # 'rpm' | 'pid' | 'vel' | 'one_d_rpm' | 'one_d_pid'
@@ -74,10 +74,22 @@ CURRICULUM_LOG_FREQUENCY = 2048  # How often to log curriculum status
 
 def evaluate_policy_with_progress(model, env, n_eval_episodes=10, deterministic=True):
     """
-    Custom evaluation function with progress indicators
+    Custom evaluation function with progress indicators and TensorBoard logging
     """
+    from stable_baselines3.common.logger import configure
+    import os
+    
     all_episode_rewards = []
     all_episode_lengths = []
+    all_containment_percentages = []
+    all_angular_coverages = []
+    all_final_distances = []
+    
+    # Setup TensorBoard logging for evaluation
+    eval_log_dir = os.path.join(os.path.dirname(model.logger.dir if hasattr(model, 'logger') and model.logger.dir else 'logs'), 'eval_tb')
+    os.makedirs(eval_log_dir, exist_ok=True)
+    eval_logger = configure(eval_log_dir, ["tensorboard"])
+    print(f"[EVAL LOG] TensorBoard evaluation logs: {eval_log_dir}")
     
     print(f"[INFO] Starting evaluation with {n_eval_episodes} episodes...")
     print("Progress: ", end="", flush=True)
@@ -115,19 +127,44 @@ def evaluate_policy_with_progress(model, env, n_eval_episodes=10, deterministic=
         # Episode completion logging
         termination_reason = "TERMINATED" if terminated else "TRUNCATED" if truncated else "COMPLETED"
         try:
-            # Get final states for detailed logging
+            # Get final states for detailed logging and TensorBoard
             drone_states = [env.unwrapped._getDroneStateVector(i) for i in range(env.unwrapped.NUM_DRONES)]
             herd_center = env.unwrapped.HerdCentroid()
             drone_center = np.mean([d[:2] for d in drone_states], axis=0)
             final_distance = np.linalg.norm(drone_center - herd_center[:2])
+            
+            # Get containment metrics if available
+            containment_percentage = 0.0
+            angular_coverage = 0.0
+            if hasattr(env.unwrapped, '_compute_detailed_containment_metrics'):
+                cattle_poses = [env.unwrapped._getCowStateVector(i) for i in range(env.unwrapped.NUM_CATTLE)]
+                drone_poses = [env.unwrapped._getDroneStateVector(i) for i in range(env.unwrapped.NUM_DRONES)]
+                containment_percentage, _, _, angular_coverage, _, _ = env.unwrapped._compute_detailed_containment_metrics(cattle_poses, drone_poses)
+            
+            # Store metrics for final summary
+            all_containment_percentages.append(containment_percentage)
+            all_angular_coverages.append(angular_coverage)
+            all_final_distances.append(final_distance)
+            
+            # Log to TensorBoard
+            eval_logger.record(f"eval/episode_reward", episode_reward)
+            eval_logger.record(f"eval/episode_length", episode_length)
+            eval_logger.record(f"eval/final_distance_to_herd", final_distance)
+            eval_logger.record(f"eval/containment_percentage", containment_percentage)
+            eval_logger.record(f"eval/angular_coverage", angular_coverage)
+            eval_logger.record(f"eval/avg_reward_per_step", episode_reward/episode_length)
+            eval_logger.record(f"eval/termination_reason", 1.0 if terminated else 0.0)  # 1.0 = terminated, 0.0 = truncated
+            eval_logger.dump(step=episode + 1)
             
             print(f"\n📊 EPISODE {episode + 1} FINISHED ({termination_reason})")
             print(f"  📈 Total Reward: {episode_reward:.2f}")
             print(f"  ⏱️  Episode Length: {episode_length:,} steps")
             print(f"  📏 Final Distance to Herd: {final_distance:.2f}m")
             print(f"  🎯 Avg Reward per Step: {episode_reward/episode_length:.3f}")
+            print(f"  📊 Containment: {containment_percentage:.1f}% | Coverage: {angular_coverage:.1f}°")
         except Exception as e:
             print(f"\n📊 EPISODE {episode + 1} FINISHED ({termination_reason})")
+            print(f"  [LOG ERROR] {e}")
             print(f"  📈 Total Reward: {episode_reward:.2f}")
             print(f"  ⏱️  Episode Length: {episode_length:,} steps")
             print(f"  ❌ State info unavailable: {e}")
@@ -148,11 +185,35 @@ def evaluate_policy_with_progress(model, env, n_eval_episodes=10, deterministic=
     std_reward = np.std(all_episode_rewards)
     mean_length = np.mean(all_episode_lengths)
     
+    # Final summary logging to TensorBoard
+    if all_containment_percentages:
+        mean_containment = np.mean(all_containment_percentages)
+        mean_angular_coverage = np.mean(all_angular_coverages)
+        mean_final_distance = np.mean(all_final_distances)
+        
+        # Log summary statistics
+        eval_logger.record("eval_summary/mean_reward", mean_reward)
+        eval_logger.record("eval_summary/std_reward", std_reward)
+        eval_logger.record("eval_summary/mean_episode_length", mean_length)
+        eval_logger.record("eval_summary/mean_containment_percentage", mean_containment)
+        eval_logger.record("eval_summary/mean_angular_coverage", mean_angular_coverage)
+        eval_logger.record("eval_summary/mean_final_distance", mean_final_distance)
+        eval_logger.record("eval_summary/min_reward", np.min(all_episode_rewards))
+        eval_logger.record("eval_summary/max_reward", np.max(all_episode_rewards))
+        eval_logger.record("eval_summary/success_rate", np.mean([1.0 if c >= 80.0 else 0.0 for c in all_containment_percentages]))  # 80%+ containment = success
+        eval_logger.dump(step=n_eval_episodes)
+    
     print(f"\n\n[EVALUATION COMPLETE]")
     print(f"Episodes: {n_eval_episodes}")
     print(f"Mean Reward: {mean_reward:.2f} ± {std_reward:.2f}")
     print(f"Mean Episode Length: {mean_length:.1f}")
     print(f"Min/Max Reward: {np.min(all_episode_rewards):.1f} / {np.max(all_episode_rewards):.1f}")
+    if all_containment_percentages:
+        mean_containment = np.mean(all_containment_percentages)
+        mean_angular_coverage = np.mean(all_angular_coverages)
+        success_rate = np.mean([1.0 if c >= 80.0 else 0.0 for c in all_containment_percentages])
+        print(f"Mean Containment: {mean_containment:.1f}% | Mean Coverage: {mean_angular_coverage:.1f}°")
+        print(f"Success Rate (≥80% containment): {success_rate*100:.1f}%")
     
     return mean_reward, std_reward
 
@@ -178,9 +239,9 @@ def run(
     
     # Set model directory - use different directories for different reward structures
     if eval_only:
-        model_dir = os.path.join(output_folder, 'model-alen-v06-0')  # Current curriculum-trained model
+        model_dir = os.path.join(output_folder, 'model-v06-0')  # Current curriculum-trained model
     else:
-        model_dir = os.path.join(output_folder, 'model-alen-v06-0')  # Phase 2: Containment rewards with winding number algorithm
+        model_dir = os.path.join(output_folder, 'model-v07-0')  # Phase 2: Containment rewards with winding number algorithm
     os.makedirs(model_dir, exist_ok=True)
     
     # Debug: Print actual paths

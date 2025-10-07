@@ -22,23 +22,30 @@ pip3 install -e . # if needed, `sudo apt install build-essential` to install `gc
 ```
 
 ## Development /Working Files
-envs -> BaseAviary - handles bulk of simulation 
+envs -> AdvancedCurriculumnAviary - enhanced learning environment with curriculumn learning
+        BaseAviary - handles bulk of simulation 
         BaseRLAvairy - handles action and opbservation spaces
         CattleAviary - computes reward, termination, truncated conditions
-        models - saved trained models
-examples -> CattleHerder - main file for running cattle herding
+models -> saved trained models
+simulator -> CattleHerder - main file for running cattle herding
 
 utils -> flockUtils - 
          mathUtils -
          utils
 
 
-
-## Cattle Herding Usage
+## Cattle Herding Training
 
 ```sh
-cd gym_pybullet_drones/examples/
-python3 CattleHerder.py
+cd gym_pybullet_drones/simulator/
+python CattleHerder.py --num_drones 6 --num_cattle 16 --gui False
+```
+
+## Cattle Herding Evaluation
+
+```sh
+cd gym_pybullet_drones/simulator/
+python CattleHerder.py --num_drones 6 --num_cattle 16 --gui True --eval_only True --eval_episode_length 1
 ```
 
 <img src="gym_pybullet_drones/assets/rl.gif" alt="rl example" width="375"> <img src="gym_pybullet_drones/assets/marl.gif" alt="marl example" width="375">
